@@ -21,29 +21,16 @@ use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Ticker};
 
 use core::fmt::Write;
-use heapless::String;
 
 use static_cell::make_static;
+
+use esp_now_bridge::format_mac::format_mac;
 
 extern crate alloc;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
-
-const MAC_FMT_LEN: usize = 17; // "xx:xx:xx:xx:xx:xx" = 17 chars
-                               //
-pub fn format_mac(mac: &[u8; 6]) -> String<MAC_FMT_LEN> {
-    let mut s: String<MAC_FMT_LEN> = String::new();
-    for (i, &byte) in mac.iter().enumerate() {
-        if i > 0 {
-            s.push(':').unwrap(); // Won't fail because we know capacity is enough
-        }
-        // Format byte as two lowercase hex digits
-        write!(s, "{:02x}", byte).unwrap(); // `write!` works with heapless::String
-    }
-    s
-}
 
 #[esp_rtos::main]
 async fn main(_spawner: Spawner) {

@@ -16,6 +16,8 @@ use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::Async;
 
+use esp_radio::esp_now::BROADCAST_ADDRESS;
+
 use defmt_rtt as _;
 use esp_backtrace as _;
 
@@ -27,12 +29,14 @@ use embassy_time::{Delay, Duration, Timer};
 
 use core::fmt::Write;
 
-use static_cell::StaticCell;
+use static_cell::{make_static, StaticCell};
 
 use aht20_async::Aht20;
 use bme280_rs;
+
 use esp_now_bridge::ds18b20::{check_onewire_crc, Ds18b20};
 use esp_now_bridge::esp_hal_rmt_onewire::{OneWire, Search};
+use esp_now_bridge::format_mac::format_mac;
 
 pub const RMT_FREQ_MHZ: u32 = 80;
 static I2C_BUS: StaticCell<Mutex<NoopRawMutex, i2c::master::I2c<Async>>> = StaticCell::new();
@@ -110,6 +114,8 @@ async fn main(_spawner: Spawner) {
 
     // Create shared I2C bus
     let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
+
+    // Initialise BME280
     let bme280_device = I2cDevice::new(i2c_bus);
 
     let mut bme280 = bme280_rs::AsyncBme280::new(bme280_device, delay.clone());
@@ -133,11 +139,31 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("BME280: ID={}", bme280_id);
 
+    // Initialise AHT20
     let aht20_device = I2cDevice::new(i2c_bus);
     let mut aht20 = Aht20::new(aht20_device, delay.clone())
         .await
         .expect("Error initialising BME280");
     aht20.calibrate().await.expect("Error calibrating AHT20");
+
+    // Initialise ESP_NOW
+    let esp_radio_ctrl = make_static!(esp_radio::init().unwrap());
+    let wifi = peripherals.WIFI;
+    let (mut controller, interfaces) =
+        esp_radio::wifi::new(&esp_radio_ctrl, wifi, Default::default()).unwrap();
+    controller.set_mode(esp_radio::wifi::WifiMode::Sta).unwrap();
+    controller.start().unwrap();
+
+    let mut esp_now = interfaces.esp_now;
+    esp_now.set_channel(11).unwrap();
+
+    defmt::info!("ESP-NOW VERSION: {}", esp_now.version().unwrap());
+    defmt::info!(
+        "        MAC ADDRESS: {}",
+        format_mac(&esp_radio::wifi::sta_mac())
+    );
+
+    let mut msg: heapless::String<64> = heapless::String::new();
 
     defmt::info!("");
 
@@ -159,6 +185,10 @@ async fn main(_spawner: Spawner) {
             }
         }
         defmt::info!("");
+
+        let status = esp_now.send_async(&BROADCAST_ADDRESS, b"BROADCAST").await;
+        defmt::info!("ESP-NOW  BROADCAST: {}", status);
+
         Timer::after(Duration::from_secs(5)).await;
     }
 }

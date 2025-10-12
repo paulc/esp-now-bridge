@@ -5,5 +5,6 @@
 
 pub mod ds18b20;
 pub mod esp_hal_rmt_onewire;
+pub mod format_mac;
 pub mod rgb;
 pub mod ws2812;

@@ -1,0 +1,85 @@
+[package]
+edition      = "2021"
+name         = "esp-now-bridge"
+rust-version = "1.86"
+version      = "0.1.0"
+
+[[bin]]
+name = "esp-now-bridge"
+path = "./src/bin/main.rs"
+harness = false
+
+[features]
+# Need to set chip otherwise rust-analyzer gets confused
+# (override using cargo build/run --no-default-features --features ...)
+default = ["esp32c3"]
+
+search-masks = []
+esp32s3 = [
+    "esp-hal/esp32s3",
+    "esp-bootloader-esp-idf/esp32s3",
+    "esp-alloc/esp32s3",
+    "esp-backtrace/esp32s3",
+    "esp-rtos/esp32s3",
+    "esp-radio/esp32s3",
+]
+esp32c3 = [
+    "esp-hal/esp32c3",
+    "esp-bootloader-esp-idf/esp32c3",
+    "esp-alloc/esp32c3",
+    "esp-backtrace/esp32c3",
+    "esp-rtos/esp32c3",
+    "esp-radio/esp32c3",
+]
+esp32c6 = [
+    "esp-hal/esp32c6",
+    "esp-bootloader-esp-idf/esp32c6",
+    "esp-alloc/esp32c6",
+    "esp-backtrace/esp32c6",
+    "esp-rtos/esp32c6",
+    "esp-radio/esp32c6",
+]
+
+[dependencies]
+esp-hal = { git = "https://github.com/esp-rs/esp-hal", features = ["unstable", "defmt"] }
+esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal", features = [] }
+esp-alloc = { git = "https://github.com/esp-rs/esp-hal", features = ["defmt"] }
+esp-backtrace = { git = "https://github.com/esp-rs/esp-hal", features = ["defmt", "panic-handler"] }
+esp-rtos = { git = "https://github.com/esp-rs/esp-hal", features = ["esp-radio", "defmt", "embassy"] }
+esp-radio = { git = "https://github.com/esp-rs/esp-hal", features = ["esp-now", "defmt", "unstable", "wifi"] }
+
+embassy-executor = { version = "0.9.1", features = ["defmt"] }
+embassy-time = { version = "0.5.0", features = ["defmt"] }
+embassy-futures = { version = "0.1.2", features = ["defmt"] }
+embassy-sync = { version = "0.7.2", features = ["defmt"] }
+
+critical-section = "1.2.0"
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+
+heapless = { version = "0.9.1", features = ["defmt"] }
+embedded-io-async = { version = "0.6.1" }
+static_cell = { version = "2.1.1", features = ["nightly"] }
+anyhow = { version = "1.0.100", default-features = false }
+bme280-rs = "0.3.0"
+embassy-embedded-hal = { version = "0.5.0", features = ["defmt"] }
+aht20-async = "1.0.0"
+
+[profile.dev]
+# Rust debug is too slow.
+# For debug builds always builds with some optimization
+opt-level = "s"
+
+[profile.release]
+codegen-units    = 1     # LLVM can perform better optimizations using a single thread
+debug            = 2
+debug-assertions = false
+incremental      = false
+#lto              = 'fat'
+lto              = 'off'
+opt-level        = 's'
+overflow-checks  = false
+
+[patch.crates-io]
+esp-hal = { git = "https://github.com/esp-rs/esp-hal" }
+esp-riscv-rt = { git = "https://github.com/esp-rs/esp-hal" }

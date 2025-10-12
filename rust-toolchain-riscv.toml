@@ -1,0 +1,7 @@
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]
+targets = [
+  "riscv32imc-unknown-none-elf",    # for ESP32-C3
+  "riscv32imac-unknown-none-elf",   # for ESP32-C6
+]

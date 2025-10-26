@@ -1,22 +1,27 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
+#![feature(proc_macro_hygiene)]
 #![deny(
     clippy::mem_forget,
     reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
     holding buffers for the duration of a data transfer."
 )]
 
+extern crate alloc;
+
 use esp_backtrace as _;
 use esp_hal::i2c;
 #[cfg(target_arch = "riscv32")]
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::rmt::Rmt;
+use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
+use esp_hal::rtc_cntl::Rtc;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::Async;
 
-use esp_radio::esp_now::BROADCAST_ADDRESS;
+use esp_radio::esp_now::{PeerInfo, BROADCAST_ADDRESS};
 
 use defmt_rtt as _;
 use esp_backtrace as _;
@@ -31,6 +36,8 @@ use core::fmt::Write;
 
 use static_cell::{make_static, StaticCell};
 
+use serde::{Deserialize, Serialize};
+
 use aht20_async::Aht20;
 use bme280_rs;
 
@@ -38,8 +45,49 @@ use esp_now_bridge::ds18b20::{check_onewire_crc, Ds18b20};
 use esp_now_bridge::esp_hal_rmt_onewire::{OneWire, Search};
 use esp_now_bridge::format_mac::format_mac;
 
+const MAX_SENSORS: usize = 10_usize;
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+pub enum SensorValue {
+    Float(f32),
+    String(heapless::String<16>),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SensorReading {
+    path: heapless::String<32>,
+    value: SensorValue,
+    retain: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SensorData {
+    mac: heapless::String<17>,
+    data: heapless::Vec<SensorReading, MAX_SENSORS>,
+}
+
+impl SensorData {
+    pub fn new(mac: heapless::String<17>) -> Self {
+        let data = heapless::Vec::new();
+        Self { mac, data }
+    }
+    pub fn push(&mut self, path: &str, value: SensorValue, retain: bool) -> anyhow::Result<()> {
+        self.data
+            .push(SensorReading {
+                path: path.try_into()?,
+                value,
+                retain,
+            })
+            .map_err(|_| anyhow::anyhow!("Too many SensorValues"))
+    }
+}
+
 pub const RMT_FREQ_MHZ: u32 = 80;
 static I2C_BUS: StaticCell<Mutex<NoopRawMutex, i2c::master::I2c<Async>>> = StaticCell::new();
+
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut HUB_ADDRESS: [u8; 6] = [0; 6];
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -146,7 +194,12 @@ async fn main(_spawner: Spawner) {
         .expect("Error initialising BME280");
     aht20.calibrate().await.expect("Error calibrating AHT20");
 
+    // Setup RTC sleep
+    let mut rtc = Rtc::new(peripherals.LPWR);
+    let timer = TimerWakeupSource::new(core::time::Duration::from_secs(5));
+
     // Initialise ESP_NOW
+    defmt::info!("Initialise ESP_NOW");
     let esp_radio_ctrl = make_static!(esp_radio::init().unwrap());
     let wifi = peripherals.WIFI;
     let (mut controller, interfaces) =
@@ -165,30 +218,128 @@ async fn main(_spawner: Spawner) {
 
     let mut msg: heapless::String<64> = heapless::String::new();
 
-    defmt::info!("");
+    let hub_address = unsafe {
+        let hub_address = &raw const HUB_ADDRESS;
+        defmt::info!("HUB_ADDRESS: {}", format_mac(&*hub_address));
+        *hub_address.clone()
+    };
+
+    if hub_address != [0; 6] {
+        // Valid hub address - add peer
+        if !esp_now.peer_exists(&hub_address) {
+            defmt::info!("ESP-NOW ADD PEER: {}", format_mac(&hub_address));
+            esp_now
+                .add_peer(PeerInfo {
+                    interface: esp_radio::esp_now::EspNowWifiInterface::Sta,
+                    peer_address: hub_address,
+                    lmk: None,
+                    channel: None,
+                    encrypt: false,
+                })
+                .unwrap();
+        }
+    } else {
+        loop {
+            let r = esp_now.receive_async().await;
+            defmt::info!(
+                "ESP-NOW RX: [{}]->[{}] >> {} [rssi={}]",
+                format_mac(&r.info.src_address),
+                format_mac(&r.info.dst_address),
+                core::str::from_utf8(r.data()).unwrap_or("UTF8 Error"),
+                r.info.rx_control.rssi
+            );
+            if r.info.dst_address == BROADCAST_ADDRESS {
+                if !esp_now.peer_exists(&r.info.src_address) {
+                    defmt::info!("ESP-NOW ADD PEER: {}", format_mac(&r.info.src_address));
+                    esp_now
+                        .add_peer(PeerInfo {
+                            interface: esp_radio::esp_now::EspNowWifiInterface::Sta,
+                            peer_address: r.info.src_address,
+                            lmk: None,
+                            channel: None,
+                            encrypt: false,
+                        })
+                        .unwrap();
+                }
+                defmt::info!("PEER ADDRESS: {}", format_mac(&r.info.src_address));
+                // Report RSSI to peer
+                msg.clear();
+                write!(
+                    msg,
+                    "{} -> RSSI: {}",
+                    format_mac(&esp_radio::wifi::sta_mac()),
+                    r.info.rx_control.rssi
+                )
+                .unwrap();
+                let status = esp_now
+                    .send_async(&r.info.src_address, msg.as_bytes())
+                    .await;
+                defmt::info!("REPLY PEER: {:?}", status);
+                // Set HUB_ADDRESS
+                unsafe {
+                    HUB_ADDRESS = r.info.src_address;
+                }
+                for i in 0..5 {
+                    defmt::info!("WAIT [{}]", i);
+                    Timer::after_millis(1000).await;
+                }
+                break;
+            }
+        }
+    }
 
     loop {
+        let mut data = SensorData::new(format_mac(&esp_radio::wifi::sta_mac()));
+
         for ds in &ds18b20 {
             if let Ok(temp) = ds.read_temp(&mut ow).await {
                 let mut addr = heapless::String::<32>::new();
                 write!(addr, "{}", ds.address).unwrap();
                 defmt::info!("DS18B20: Temp = {}°C [{}]", temp, addr);
+                data.push("sensor/ds18b20/temp", SensorValue::Float(temp), true)
+                    .unwrap();
             }
             let _ = ds.initiate_conversion(&mut ow).await;
         }
         if let Ok((h, t)) = aht20.read().await {
             defmt::info!("AHT20:   Temp = {}°C / Humidity = {}%", t.celsius(), h.rh());
+            data.push("sensor/aht20/temp", SensorValue::Float(t.celsius()), true)
+                .unwrap();
+            data.push("sensor/aht20/humidity", SensorValue::Float(h.rh()), true)
+                .unwrap();
         }
         if let Ok(Some(t)) = bme280.read_temperature().await {
             if let Ok(Some(p)) = bme280.read_pressure().await {
                 defmt::info!("BME280:  Temp = {}°C / Pressure = {} hPa", t, p / 100.0);
+                data.push("sensor/bme280/temp", SensorValue::Float(t), true)
+                    .unwrap();
+                data.push(
+                    "sensor/bme280/pressure",
+                    SensorValue::Float(p / 100.0),
+                    true,
+                )
+                .unwrap();
             }
         }
         defmt::info!("");
 
-        let status = esp_now.send_async(&BROADCAST_ADDRESS, b"BROADCAST").await;
-        defmt::info!("ESP-NOW  BROADCAST: {}", status);
+        let json = serde_json::to_vec(&data).unwrap();
 
-        Timer::after(Duration::from_secs(5)).await;
+        unsafe {
+            let ptr = &raw const HUB_ADDRESS;
+            if *ptr != [0; 6] {
+                // Send to Hub
+                let status = esp_now.send_async(&*ptr, &json).await;
+                defmt::info!("ESP-NOW TX -> {}: {}", format_mac(&*ptr), status);
+            } else {
+                // Send Broadcast
+                let status = esp_now.send_async(&BROADCAST_ADDRESS, &json).await;
+                defmt::info!("ESP-NOW BROADCAST: {}", status);
+            }
+        };
+
+        // Sleep
+        Timer::after_millis(1000).await;
+        rtc.sleep_deep(&[&timer]);
     }
 }

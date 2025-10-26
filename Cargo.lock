@@ -728,6 +728,8 @@ dependencies = [
  "esp-radio",
  "esp-rtos",
  "heapless 0.9.1",
+ "serde",
+ "serde_json",
  "static_cell",
 ]
 
@@ -1054,6 +1056,7 @@ checksum = "b1edcd5a338e64688fbdcb7531a846cfd3476a54784dcb918a0844682bc7ada5"
 dependencies = [
  "defmt 1.0.1",
  "hash32",
+ "serde",
  "stable_deref_trait",
 ]
 
@@ -1456,6 +1459,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.106",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.145"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "402a6f66d8c709116cf22f558eab210f5a50187f702eb4d7e5ef38d9a7f1c79c"
+dependencies = [
+ "itoa",
+ "memchr",
+ "ryu",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

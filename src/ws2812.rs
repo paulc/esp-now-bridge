@@ -6,16 +6,16 @@ use crate::rgb::{Rgb, RgbLayout};
 
 use anyhow;
 
-pub const RMT_FREQ_MHZ: u32 = 80;
+pub const APB_CLOCK_MHZ: u32 = 80;
 pub const RMT_CLK_DIVIDER: u8 = 2;
 
 // WS2812 timings: 1us = RMT_FREQ / RMT_CLK_DIVIDER
-const RMT_CHAN_FREQ: u16 = RMT_FREQ_MHZ as u16 / RMT_CLK_DIVIDER as u16;
+const RMT_CHAN_FREQ: u16 = APB_CLOCK_MHZ as u16 / RMT_CLK_DIVIDER as u16;
 const T0H: u16 = RMT_CHAN_FREQ * 400 / 1000; // 0.4us
 const T0L: u16 = RMT_CHAN_FREQ * 850 / 1000; // 0.85us
 const T1H: u16 = RMT_CHAN_FREQ * 800 / 1000; // 0.8us
 const T1L: u16 = RMT_CHAN_FREQ * 450 / 1000; // 0.45us
-const RESET_H: u16 = RMT_CHAN_FREQ * 50; // 50us
+const RESET_H: u16 = RMT_CHAN_FREQ * 100; // 100us
 
 const T0: PulseCode = PulseCode::new(Level::High, T0H, Level::Low, T0L);
 const T1: PulseCode = PulseCode::new(Level::High, T1H, Level::Low, T1L);

@@ -67,65 +67,6 @@ async fn main(_spawner: Spawner) {
     );
 
     let mut msg: heapless::String<64> = heapless::String::new();
-
-    /*
-    let mut peer_address: Option<[u8; 6]> = None;
-    loop {
-        let r = esp_now.receive_async().await;
-        defmt::info!(
-            "ESP-NOW RX: [{}]->[{}] >> {} [rssi={}]",
-            format_mac(&r.info.src_address),
-            format_mac(&r.info.dst_address),
-            core::str::from_utf8(r.data()).unwrap_or("UTF8 Error"),
-            r.info.rx_control.rssi
-        );
-        if r.info.dst_address == BROADCAST_ADDRESS {
-            if !esp_now.peer_exists(&r.info.src_address) {
-                defmt::info!("ESP-NOW ADD PEER: {}", format_mac(&r.info.src_address));
-                esp_now
-                    .add_peer(PeerInfo {
-                        interface: esp_radio::esp_now::EspNowWifiInterface::Sta,
-                        peer_address: r.info.src_address,
-                        lmk: None,
-                        channel: None,
-                        encrypt: false,
-                    })
-                    .unwrap();
-            }
-            // Report RSSI to peer
-            msg.clear();
-            write!(
-                msg,
-                "{} -> RSSI: {}",
-                format_mac(&esp_radio::wifi::sta_mac()),
-                r.info.rx_control.rssi
-            )
-            .unwrap();
-            let status = esp_now
-                .send_async(&r.info.src_address, msg.as_bytes())
-                .await;
-            defmt::info!("REPLY PEER: {:?}", status);
-            peer_address = Some(r.info.src_address);
-            break;
-        }
-    }
-
-    defmt::info!("ESP_NOW PEERING OK");
-    controller.stop().unwrap();
-    let mut ticker = Ticker::every(Duration::from_secs(10));
-
-    loop {
-        if let Some(ref peer) = peer_address {
-            controller.start().unwrap();
-            esp_now.set_channel(11).unwrap();
-            defmt::info!("PEER: {}", esp_now.peer_exists(peer));
-            let status = esp_now.send_async(&peer, b"PING").await;
-            controller.stop().unwrap();
-            defmt::info!("PING: {:?}", status);
-        }
-        ticker.next().await;
-    }
-    */
     let mut ticker = Ticker::every(Duration::from_secs(10));
     loop {
         let res = select(ticker.next(), async {

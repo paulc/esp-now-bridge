@@ -11,11 +11,15 @@
 extern crate alloc;
 
 use esp_backtrace as _;
+#[cfg(any(feature = "esp32s3"))]
+use esp_hal::gpio::RtcPin as RtcIoWakeupPinType;
+#[cfg(any(feature = "esp32c3", feature = "esp32c6"))]
+use esp_hal::gpio::RtcPinWithResistors as RtcIoWakeupPinType;
 use esp_hal::i2c;
 #[cfg(target_arch = "riscv32")]
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::rmt::Rmt;
-use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
+use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, TimerWakeupSource, WakeupLevel};
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
@@ -30,64 +34,29 @@ use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Delay, Duration, Timer};
+use embassy_time::{Delay, Timer};
 
 use core::fmt::Write;
 
 use static_cell::{make_static, StaticCell};
 
-use serde::{Deserialize, Serialize};
-
 use aht20_async::Aht20;
 use bme280_rs;
+
+use sensor_data::{SensorData, SensorValue};
 
 use esp_now_bridge::ds18b20::{check_onewire_crc, Ds18b20};
 use esp_now_bridge::esp_hal_rmt_onewire::{OneWire, Search};
 use esp_now_bridge::format_mac::format_mac;
-
-const MAX_SENSORS: usize = 10_usize;
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(untagged)]
-pub enum SensorValue {
-    Float(f32),
-    String(heapless::String<16>),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct SensorReading {
-    path: heapless::String<32>,
-    value: SensorValue,
-    retain: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct SensorData {
-    mac: heapless::String<17>,
-    data: heapless::Vec<SensorReading, MAX_SENSORS>,
-}
-
-impl SensorData {
-    pub fn new(mac: heapless::String<17>) -> Self {
-        let data = heapless::Vec::new();
-        Self { mac, data }
-    }
-    pub fn push(&mut self, path: &str, value: SensorValue, retain: bool) -> anyhow::Result<()> {
-        self.data
-            .push(SensorReading {
-                path: path.try_into()?,
-                value,
-                retain,
-            })
-            .map_err(|_| anyhow::anyhow!("Too many SensorValues"))
-    }
-}
 
 pub const RMT_FREQ_MHZ: u32 = 80;
 static I2C_BUS: StaticCell<Mutex<NoopRawMutex, i2c::master::I2c<Async>>> = StaticCell::new();
 
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static mut HUB_ADDRESS: [u8; 6] = [0; 6];
+
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut FIRST_BOOT: u8 = 1;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -96,7 +65,20 @@ esp_bootloader_esp_idf::esp_app_desc!();
 #[esp_rtos::main]
 async fn main(_spawner: Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default());
-    defmt::info!("Init");
+
+    // Setup RTC & Sleep Timer
+    let mut rtc = Rtc::new(peripherals.LPWR);
+    let timer = TimerWakeupSource::new(core::time::Duration::from_secs(30));
+    let mut pin_1 = peripherals.GPIO1;
+    let wakeup_pins: &mut [(&mut dyn RtcIoWakeupPinType, WakeupLevel)] =
+        &mut [(&mut pin_1, WakeupLevel::Low)];
+    let rtcio = RtcioWakeupSource::new(wakeup_pins);
+
+    defmt::info!(
+        "INIT: wakeup={} boot={}",
+        esp_hal::rtc_cntl::wakeup_cause(),
+        rtc.time_since_boot().as_millis()
+    );
 
     esp_alloc::heap_allocator!(size: 64 * 1024);
 
@@ -154,10 +136,13 @@ async fn main(_spawner: Spawner) {
         .into_async();
 
     // I2C Bus Scan
-    for addr in 0..=127 {
-        if let Ok(_) = i2c.write_async(addr, &[0]).await {
-            defmt::info!("Found I2C device at address: 0x{:02x}", addr);
+    if unsafe { FIRST_BOOT } == 1 {
+        for addr in 0..=127 {
+            if let Ok(_) = i2c.write_async(addr, &[0]).await {
+                defmt::info!("Found I2C device at address: 0x{:02x}", addr);
+            }
         }
+        unsafe { FIRST_BOOT = 0 }
     }
 
     // Create shared I2C bus
@@ -194,10 +179,6 @@ async fn main(_spawner: Spawner) {
         .expect("Error initialising BME280");
     aht20.calibrate().await.expect("Error calibrating AHT20");
 
-    // Setup RTC sleep
-    let mut rtc = Rtc::new(peripherals.LPWR);
-    let timer = TimerWakeupSource::new(core::time::Duration::from_secs(5));
-
     // Initialise ESP_NOW
     defmt::info!("Initialise ESP_NOW");
     let esp_radio_ctrl = make_static!(esp_radio::init().unwrap());
@@ -218,7 +199,7 @@ async fn main(_spawner: Spawner) {
 
     let mut msg: heapless::String<64> = heapless::String::new();
 
-    let hub_address = unsafe {
+    let mut hub_address = unsafe {
         let hub_address = &raw const HUB_ADDRESS;
         defmt::info!("HUB_ADDRESS: {}", format_mac(&*hub_address));
         *hub_address.clone()
@@ -239,6 +220,7 @@ async fn main(_spawner: Spawner) {
                 .unwrap();
         }
     } else {
+        // Wait for HUB broadcast
         loop {
             let r = esp_now.receive_async().await;
             defmt::info!(
@@ -279,6 +261,8 @@ async fn main(_spawner: Spawner) {
                 unsafe {
                     HUB_ADDRESS = r.info.src_address;
                 }
+                // Set local
+                hub_address = r.info.src_address;
                 for i in 0..5 {
                     defmt::info!("WAIT [{}]", i);
                     Timer::after_millis(1000).await;
@@ -325,21 +309,75 @@ async fn main(_spawner: Spawner) {
 
         let json = serde_json::to_vec(&data).unwrap();
 
-        unsafe {
-            let ptr = &raw const HUB_ADDRESS;
-            if *ptr != [0; 6] {
-                // Send to Hub
-                let status = esp_now.send_async(&*ptr, &json).await;
-                defmt::info!("ESP-NOW TX -> {}: {}", format_mac(&*ptr), status);
-            } else {
-                // Send Broadcast
-                let status = esp_now.send_async(&BROADCAST_ADDRESS, &json).await;
-                defmt::info!("ESP-NOW BROADCAST: {}", status);
-            }
-        };
+        if hub_address != [0; 6] {
+            // Send to Hub
+            let status = esp_now.send_async(&hub_address, &json).await;
+            defmt::info!("ESP-NOW TX -> {}: {}", format_mac(&hub_address), status);
+        } else {
+            // Send Broadcast
+            defmt::info!("NO HUB_ADDRESS");
+        }
 
-        // Sleep
-        Timer::after_millis(1000).await;
-        rtc.sleep_deep(&[&timer]);
+        // Wait for response
+        loop {
+            let r = esp_now.receive_async().await;
+            defmt::info!(
+                "ESP-NOW RX: [{}]->[{}] >> {} [rssi={}]",
+                format_mac(&r.info.src_address),
+                format_mac(&r.info.dst_address),
+                core::str::from_utf8(r.data()).unwrap_or("UTF8 Error"),
+                r.info.rx_control.rssi
+            );
+            if r.info.src_address == hub_address {
+                defmt::info!("HUB RESPONSE: OK");
+                break;
+            }
+        }
+        defmt::info!("UPTIME: {}", rtc.time_since_boot().as_millis());
+        Timer::after_millis(200).await;
+        rtc.sleep_deep(&[&timer, &rtcio]);
+    }
+}
+
+mod sensor_data {
+
+    use serde::{Deserialize, Serialize};
+
+    pub const MAX_SENSORS: usize = 10_usize;
+
+    #[derive(Serialize, Deserialize, Debug)]
+    #[serde(untagged)]
+    pub enum SensorValue {
+        Float(f32),
+        String(heapless::String<16>),
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct SensorReading {
+        path: heapless::String<32>,
+        value: SensorValue,
+        retain: bool,
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct SensorData {
+        mac: heapless::String<17>,
+        data: heapless::Vec<SensorReading, MAX_SENSORS>,
+    }
+
+    impl SensorData {
+        pub fn new(mac: heapless::String<17>) -> Self {
+            let data = heapless::Vec::new();
+            Self { mac, data }
+        }
+        pub fn push(&mut self, path: &str, value: SensorValue, retain: bool) -> anyhow::Result<()> {
+            self.data
+                .push(SensorReading {
+                    path: path.try_into()?,
+                    value,
+                    retain,
+                })
+                .map_err(|_| anyhow::anyhow!("Too many SensorValues"))
+        }
     }
 }

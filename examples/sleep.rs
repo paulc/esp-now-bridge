@@ -7,7 +7,11 @@
     holding buffers for the duration of a data transfer."
 )]
 
-use esp_hal::gpio::{Level, RtcPinWithResistors};
+use esp_hal::gpio::Level;
+#[cfg(feature = "esp32s3")]
+use esp_hal::gpio::RtcPin as RtcIoWakeupPinType;
+#[cfg(any(feature = "esp32c3", feature = "esp32c6"))]
+use esp_hal::gpio::RtcPinWithResistors as RtcIoWakeupPinType;
 #[cfg(target_arch = "riscv32")]
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
@@ -29,7 +33,7 @@ use embassy_sync::signal::Signal;
 use static_cell::make_static;
 
 use esp_now_bridge::rgb::{Rgb, RgbLayout};
-use esp_now_bridge::ws2812::{Ws2812Single, RMT_CLK_DIVIDER, RMT_FREQ_MHZ};
+use esp_now_bridge::ws2812::{Ws2812Single, APB_CLOCK_MHZ, RMT_CLK_DIVIDER};
 
 extern crate alloc;
 
@@ -55,7 +59,7 @@ async fn main(spawner: Spawner) {
         sw_int.software_interrupt0,
     );
 
-    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(RMT_FREQ_MHZ))
+    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(APB_CLOCK_MHZ))
         .expect("Error initialising RMT")
         .into_async();
 
@@ -64,9 +68,21 @@ async fn main(spawner: Spawner) {
         .with_idle_output_level(Level::Low)
         .with_carrier_modulation(false);
 
+    #[cfg(feature = "esp32c3")]
     let gpio = peripherals.GPIO10;
+    #[cfg(feature = "esp32s3")]
+    let gpio = peripherals.GPIO21;
+
     let channel = rmt.channel0.configure_tx(gpio, tx_config).unwrap();
-    let ws2812 = Ws2812Single::new(channel, RgbLayout::Rgb);
+    let mut ws2812 = Ws2812Single::new(channel, RgbLayout::Rgb);
+
+    for c in [Rgb::new(20, 0, 0), Rgb::new(0, 20, 0), Rgb::new(0, 0, 20)] {
+        defmt::info!(">> {}", c);
+        ws2812.set(c).await.unwrap();
+        Timer::after_millis(1000).await;
+        ws2812.set(Rgb::new(0, 0, 0)).await.unwrap();
+        Timer::after_millis(1000).await;
+    }
 
     // LED task
     spawner
@@ -74,9 +90,9 @@ async fn main(spawner: Spawner) {
         .expect("Error spawning led task");
 
     let mut rtc = Rtc::new(peripherals.LPWR);
-    let timer = TimerWakeupSource::new(core::time::Duration::from_secs(55));
+    let timer = TimerWakeupSource::new(core::time::Duration::from_secs(10));
     let mut pin5 = peripherals.GPIO5;
-    let mut rtcio_pins: &mut [(&mut dyn RtcPinWithResistors, WakeupLevel)] =
+    let mut rtcio_pins: &mut [(&mut dyn RtcIoWakeupPinType, WakeupLevel)] =
         &mut [(&mut pin5, WakeupLevel::Low)];
     let rtcio = RtcioWakeupSource::new(&mut rtcio_pins);
 

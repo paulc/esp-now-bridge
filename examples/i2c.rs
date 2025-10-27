@@ -49,7 +49,7 @@ use esp_now_bridge::ds18b20::{check_onewire_crc, Ds18b20};
 use esp_now_bridge::esp_hal_rmt_onewire::{OneWire, Search};
 use esp_now_bridge::format_mac::format_mac;
 
-pub const RMT_FREQ_MHZ: u32 = 80;
+pub const APB_CLOCK_MHZ: u32 = 80;
 static I2C_BUS: StaticCell<Mutex<NoopRawMutex, i2c::master::I2c<Async>>> = StaticCell::new();
 
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
@@ -95,7 +95,7 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("ESP_RTOS initialized!");
 
-    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(RMT_FREQ_MHZ))
+    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(APB_CLOCK_MHZ))
         .expect("Error initialising RMT")
         .into_async();
 

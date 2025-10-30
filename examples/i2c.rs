@@ -43,11 +43,10 @@ use static_cell::{make_static, StaticCell};
 use aht20_async::Aht20;
 use bme280_rs;
 
-use sensor_data::{SensorData, SensorValue};
-
 use esp_now_bridge::ds18b20::{check_onewire_crc, Ds18b20};
 use esp_now_bridge::esp_hal_rmt_onewire::{OneWire, Search};
 use esp_now_bridge::format_mac::format_mac;
+use sensor_message::SensorMessage;
 
 pub const APB_CLOCK_MHZ: u32 = 80;
 static I2C_BUS: StaticCell<Mutex<NoopRawMutex, i2c::master::I2c<Async>>> = StaticCell::new();
@@ -273,45 +272,44 @@ async fn main(_spawner: Spawner) {
     }
 
     loop {
-        let mut data = SensorData::new(format_mac(&esp_radio::wifi::sta_mac()));
+        let mut data = SensorMessage::new(esp_radio::wifi::sta_mac(), b"prefix/sensor").unwrap();
 
         for ds in &ds18b20 {
             if let Ok(temp) = ds.read_temp(&mut ow).await {
                 let mut addr = heapless::String::<32>::new();
                 write!(addr, "{}", ds.address).unwrap();
                 defmt::info!("DS18B20: Temp = {}°C [{}]", temp, addr);
-                data.push("sensor/ds18b20/temp", SensorValue::Float(temp), true)
-                    .unwrap();
+                data.push_f32(b"ds18b20/temp", temp, true).unwrap();
             }
             let _ = ds.initiate_conversion(&mut ow).await;
         }
         if let Ok((h, t)) = aht20.read().await {
             defmt::info!("AHT20:   Temp = {}°C / Humidity = {}%", t.celsius(), h.rh());
-            data.push("sensor/aht20/temp", SensorValue::Float(t.celsius()), true)
-                .unwrap();
-            data.push("sensor/aht20/humidity", SensorValue::Float(h.rh()), true)
-                .unwrap();
+            data.push_f32(b"aht20/temp", t.celsius(), true).unwrap();
+            data.push_f32(b"aht20/humidity", h.rh(), true).unwrap();
         }
         if let Ok(Some(t)) = bme280.read_temperature().await {
             if let Ok(Some(p)) = bme280.read_pressure().await {
                 defmt::info!("BME280:  Temp = {}°C / Pressure = {} hPa", t, p / 100.0);
-                data.push("sensor/bme280/temp", SensorValue::Float(t), true)
-                    .unwrap();
-                data.push(
-                    "sensor/bme280/pressure",
-                    SensorValue::Float(p / 100.0),
-                    true,
-                )
-                .unwrap();
+                data.push_f32(b"bme280/temp", t, true).unwrap();
+                data.push_f32(b"bme280/pressure", p / 100.0, true).unwrap();
             }
         }
         defmt::info!("");
 
-        let json = serde_json::to_vec(&data).unwrap();
+        let mut buf = [0u8; 256];
+        let pc_buf = postcard::to_slice(&data, &mut buf).unwrap();
+        defmt::info!(">> POSTCARD {} :: {}", pc_buf.len(), pc_buf);
+        match postcard::from_bytes::<SensorMessage>(&pc_buf) {
+            Ok(msg) => defmt::info!(">> Postcard Decode OK: {:?}", msg.mac),
+            Err(_) => defmt::error!(">> Postcard Error"),
+        }
+
+        // let json = serde_json::to_vec(&data).unwrap();
 
         if hub_address != [0; 6] {
             // Send to Hub
-            let status = esp_now.send_async(&hub_address, &json).await;
+            let status = esp_now.send_async(&hub_address, &pc_buf).await;
             defmt::info!("ESP-NOW TX -> {}: {}", format_mac(&hub_address), status);
         } else {
             // Send Broadcast
@@ -339,6 +337,7 @@ async fn main(_spawner: Spawner) {
     }
 }
 
+/*
 mod sensor_data {
 
     use serde::{Deserialize, Serialize};
@@ -381,3 +380,4 @@ mod sensor_data {
         }
     }
 }
+*/

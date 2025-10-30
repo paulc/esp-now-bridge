@@ -66,6 +66,8 @@ embassy-embedded-hal = { version = "0.5.0", features = ["defmt"] }
 aht20-async = "1.0.0"
 serde = { version = "1.0.228", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1.0.145", default-features = false, features = ["alloc"] }
+postcard = "1.1.3"
+sensor-message = { path = "../sensor-message" }
 
 [profile.dev]
 # Rust debug is too slow.

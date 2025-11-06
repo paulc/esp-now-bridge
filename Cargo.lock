@@ -751,6 +751,7 @@ dependencies = [
  "serde",
  "serde_json",
  "static_cell",
+ "tinybuf",
 ]
 
 [[package]]
@@ -1709,6 +1710,10 @@ dependencies = [
  "quote",
  "syn 2.0.106",
 ]
+
+[[package]]
+name = "tinybuf"
+version = "0.1.0"
 
 [[package]]
 name = "toml_datetime"

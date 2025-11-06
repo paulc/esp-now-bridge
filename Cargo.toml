@@ -68,6 +68,7 @@ serde = { version = "1.0.228", default-features = false, features = ["alloc", "d
 serde_json = { version = "1.0.145", default-features = false, features = ["alloc"] }
 postcard = "1.1.3"
 sensor-message = { path = "../sensor-message" }
+tinybuf = { version = "0.1.0", path = "../tinybuf" }
 
 [profile.dev]
 # Rust debug is too slow.

@@ -38,10 +38,14 @@ static I2C_BUS: StaticCell<Mutex<NoopRawMutex, i2c::master::I2c<Async>>> = Stati
 esp_bootloader_esp_idf::esp_app_desc!();
 
 #[esp_rtos::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default());
+    let rtc = esp_hal::rtc_cntl::Rtc::new(peripherals.LPWR);
 
-    defmt::info!("INIT: wakeup={}", esp_hal::rtc_cntl::wakeup_cause(),);
+    let boot_time = rtc.time_since_boot().as_millis();
+    let wakeup_cause = esp_hal::rtc_cntl::wakeup_cause();
+
+    defmt::info!("INIT: boot_time={} wakeup={}", boot_time, wakeup_cause);
 
     esp_alloc::heap_allocator!(size: 64 * 1024);
 
@@ -76,22 +80,44 @@ async fn main(_spawner: Spawner) {
     let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
 
     let aht20_device = I2cDevice::new(i2c_bus);
-    let mut aht20 = aht20::Aht20::new(aht20_device, 0x38);
-    defmt::info!("AHT20 INIT: {}", aht20.init().await.unwrap());
+    spawner.spawn(aht20_task(aht20_device)).unwrap();
 
     let bmp280_device = I2cDevice::new(i2c_bus);
-    let mut bmp280 = bmp280::Bmp280::new(bmp280_device, 0x77);
+    spawner.spawn(bmp280_task(bmp280_device)).unwrap();
+
+    loop {
+        Timer::after_millis(5000).await;
+        let now = rtc.time_since_boot().as_millis();
+        defmt::info!("Tick: [{}]", now - boot_time);
+    }
+}
+
+#[embassy_executor::task]
+async fn aht20_task(
+    i2c: I2cDevice<'static, NoopRawMutex, esp_hal::i2c::master::I2c<'static, Async>>,
+) {
+    let mut aht20 = aht20::Aht20::new(i2c, 0x38);
+    defmt::info!("AHT20 INIT: {}", aht20.init().await.unwrap());
+    loop {
+        let (rh, t) = aht20.read().await.unwrap();
+        defmt::info!("AHT20  TEMP: {}°C", t);
+        defmt::info!("       HUMIDITY: {}%", rh);
+        Timer::after_millis(5000).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn bmp280_task(
+    i2c: I2cDevice<'static, NoopRawMutex, esp_hal::i2c::master::I2c<'static, Async>>,
+) {
+    let mut bmp280 = bmp280::Bmp280::new(i2c, 0x77);
     defmt::info!("BMP280 RESET: {}", bmp280.reset().await.unwrap());
     defmt::info!("BMP280 ID: 0x{:x}", bmp280.id().await.unwrap());
     defmt::info!("BMP280 INIT: {}", bmp280.init_default().await.unwrap());
     defmt::info!("BMP280 WAIT: {}", bmp280.wait().await.unwrap());
-
     loop {
         defmt::info!("BMP280 TEMP: {}°C", bmp280.temp().await.unwrap());
         defmt::info!("       PRESSURE: {}hPa", bmp280.pressure().await.unwrap());
-        let (rh, t) = aht20.read().await.unwrap();
-        defmt::info!("AHT20 TEMP: {}°C", t);
-        defmt::info!("      HUMIDITY: {}%", rh);
         Timer::after_millis(5000).await;
     }
 }

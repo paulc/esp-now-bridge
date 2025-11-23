@@ -34,7 +34,7 @@ use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Delay, Timer};
+use embassy_time::{with_timeout, Delay, Duration, TimeoutError, Timer};
 
 use core::fmt::Write;
 
@@ -73,10 +73,12 @@ async fn main(_spawner: Spawner) {
         &mut [(&mut pin_1, WakeupLevel::Low)];
     let rtcio = RtcioWakeupSource::new(wakeup_pins);
 
+    let boot_time = rtc.time_since_boot().as_millis();
+
     defmt::info!(
         "INIT: wakeup={} boot={}",
         esp_hal::rtc_cntl::wakeup_cause(),
-        rtc.time_since_boot().as_millis()
+        boot_time
     );
 
     esp_alloc::heap_allocator!(size: 64 * 1024);
@@ -271,54 +273,51 @@ async fn main(_spawner: Spawner) {
         }
     }
 
-    loop {
-        let mut data = SensorMessage::new(esp_radio::wifi::sta_mac(), b"prefix/sensor").unwrap();
+    let mut data = SensorMessage::new(esp_radio::wifi::sta_mac(), b"prefix/sensor").unwrap();
 
-        for ds in &ds18b20 {
-            if let Ok(temp) = ds.read_temp(&mut ow).await {
-                let mut addr = heapless::String::<32>::new();
-                write!(addr, "{}", ds.address).unwrap();
-                defmt::info!("DS18B20: Temp = {}°C [{}]", temp, addr);
-                data.push_f32(b"ds18b20/temp", temp, true).unwrap();
-            }
-            let _ = ds.initiate_conversion(&mut ow).await;
+    for ds in &ds18b20 {
+        if let Ok(temp) = ds.read_temp(&mut ow).await {
+            let mut addr = heapless::String::<32>::new();
+            write!(addr, "{}", ds.address).unwrap();
+            defmt::info!("DS18B20: Temp = {}°C [{}]", temp, addr);
+            data.push_f32(b"ds18b20/temp", temp, true).unwrap();
         }
-        if let Ok((h, t)) = aht20.read().await {
-            defmt::info!("AHT20:   Temp = {}°C / Humidity = {}%", t.celsius(), h.rh());
-            data.push_f32(b"aht20/temp", t.celsius(), true).unwrap();
-            data.push_f32(b"aht20/humidity", h.rh(), true).unwrap();
+        let _ = ds.initiate_conversion(&mut ow).await;
+    }
+    if let Ok((h, t)) = aht20.read().await {
+        defmt::info!("AHT20:   Temp = {}°C / Humidity = {}%", t.celsius(), h.rh());
+        data.push_f32(b"aht20/temp", t.celsius(), true).unwrap();
+        data.push_f32(b"aht20/humidity", h.rh(), true).unwrap();
+    }
+    if let Ok(Some(t)) = bme280.read_temperature().await {
+        if let Ok(Some(p)) = bme280.read_pressure().await {
+            defmt::info!("BME280:  Temp = {}°C / Pressure = {} hPa", t, p / 100.0);
+            data.push_f32(b"bme280/temp", t, true).unwrap();
+            data.push_f32(b"bme280/pressure", p / 100.0, true).unwrap();
         }
-        if let Ok(Some(t)) = bme280.read_temperature().await {
-            if let Ok(Some(p)) = bme280.read_pressure().await {
-                defmt::info!("BME280:  Temp = {}°C / Pressure = {} hPa", t, p / 100.0);
-                data.push_f32(b"bme280/temp", t, true).unwrap();
-                data.push_f32(b"bme280/pressure", p / 100.0, true).unwrap();
-            }
-        }
-        defmt::info!("");
+    }
+    defmt::info!("");
 
-        let mut buf = [0u8; 256];
-        let pc_buf = postcard::to_slice(&data, &mut buf).unwrap();
-        defmt::info!(">> POSTCARD {} :: {}", pc_buf.len(), pc_buf);
-        match postcard::from_bytes::<SensorMessage>(&pc_buf) {
-            Ok(msg) => defmt::info!(">> Postcard Decode OK: {:?}", msg.mac),
-            Err(_) => defmt::error!(">> Postcard Error"),
-        }
+    let mut buf = [0u8; 256];
+    let pc_buf = postcard::to_slice(&data, &mut buf).unwrap();
+    defmt::info!(">> POSTCARD {} :: {}", pc_buf.len(), pc_buf);
+    match postcard::from_bytes::<SensorMessage>(&pc_buf) {
+        Ok(msg) => defmt::info!(">> Postcard Decode OK: {:?}", msg.mac),
+        Err(_) => defmt::error!(">> Postcard Error"),
+    }
 
-        // let json = serde_json::to_vec(&data).unwrap();
+    if hub_address != [0; 6] {
+        // Send to Hub
+        let status = esp_now.send_async(&hub_address, &pc_buf).await;
+        defmt::info!("ESP-NOW TX -> {}: {}", format_mac(&hub_address), status);
+    } else {
+        // Send Broadcast
+        defmt::info!("NO HUB_ADDRESS");
+    }
 
-        if hub_address != [0; 6] {
-            // Send to Hub
-            let status = esp_now.send_async(&hub_address, &pc_buf).await;
-            defmt::info!("ESP-NOW TX -> {}: {}", format_mac(&hub_address), status);
-        } else {
-            // Send Broadcast
-            defmt::info!("NO HUB_ADDRESS");
-        }
-
-        // Wait for response
-        loop {
-            let r = esp_now.receive_async().await;
+    // Wait for response
+    match with_timeout(Duration::from_millis(100), esp_now.receive_async()).await {
+        Ok(r) => {
             defmt::info!(
                 "ESP-NOW RX: [{}]->[{}] >> {} [rssi={}]",
                 format_mac(&r.info.src_address),
@@ -328,56 +327,17 @@ async fn main(_spawner: Spawner) {
             );
             if r.info.src_address == hub_address {
                 defmt::info!("HUB RESPONSE: OK");
-                break;
             }
         }
-        defmt::info!("UPTIME: {}", rtc.time_since_boot().as_millis());
-        Timer::after_millis(200).await;
-        rtc.sleep_deep(&[&timer, &rtcio]);
-    }
-}
-
-/*
-mod sensor_data {
-
-    use serde::{Deserialize, Serialize};
-
-    pub const MAX_SENSORS: usize = 10_usize;
-
-    #[derive(Serialize, Deserialize, Debug)]
-    #[serde(untagged)]
-    pub enum SensorValue {
-        Float(f32),
-        String(heapless::String<16>),
-    }
-
-    #[derive(Serialize, Deserialize, Debug)]
-    pub struct SensorReading {
-        path: heapless::String<32>,
-        value: SensorValue,
-        retain: bool,
-    }
-
-    #[derive(Serialize, Deserialize, Debug)]
-    pub struct SensorData {
-        mac: heapless::String<17>,
-        data: heapless::Vec<SensorReading, MAX_SENSORS>,
-    }
-
-    impl SensorData {
-        pub fn new(mac: heapless::String<17>) -> Self {
-            let data = heapless::Vec::new();
-            Self { mac, data }
-        }
-        pub fn push(&mut self, path: &str, value: SensorValue, retain: bool) -> anyhow::Result<()> {
-            self.data
-                .push(SensorReading {
-                    path: path.try_into()?,
-                    value,
-                    retain,
-                })
-                .map_err(|_| anyhow::anyhow!("Too many SensorValues"))
+        Err(TimeoutError) => {
+            defmt::info!("HUB RESPONSE: TIMEOUT");
         }
     }
+    defmt::info!(
+        "UPTIME: {}ms",
+        rtc.time_since_boot().as_millis() - boot_time
+    );
+    controller.stop().unwrap();
+    Timer::after_millis(100).await;
+    rtc.sleep_deep(&[&timer, &rtcio]);
 }
-*/

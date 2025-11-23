@@ -52,6 +52,9 @@ embassy-executor = { version = "0.9.1", features = ["defmt"] }
 embassy-time = { version = "0.5.0", features = ["defmt"] }
 embassy-futures = { version = "0.1.2", features = ["defmt"] }
 embassy-sync = { version = "0.7.2", features = ["defmt"] }
+embassy-embedded-hal = { version = "0.5.0", features = ["defmt"] }
+
+embedded-hal-async = { version = "1.0.0", features = ["defmt-03"] }
 
 critical-section = "1.2.0"
 defmt = "1.0.1"
@@ -61,9 +64,6 @@ heapless = { version = "0.9.1", features = ["defmt", "serde"] }
 embedded-io-async = { version = "0.6.1" }
 static_cell = { version = "2.1.1", features = ["nightly"] }
 anyhow = { version = "1.0.100", default-features = false }
-bme280-rs = "0.3.0"
-embassy-embedded-hal = { version = "0.5.0", features = ["defmt"] }
-aht20-async = "1.0.0"
 serde = { version = "1.0.228", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1.0.145", default-features = false, features = ["alloc"] }
 postcard = "1.1.3"

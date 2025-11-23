@@ -1,129 +1,80 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
+#![feature(proc_macro_hygiene)]
 #![deny(
     clippy::mem_forget,
     reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
     holding buffers for the duration of a data transfer."
 )]
 
-use esp_hal::gpio::Level;
-#[cfg(feature = "esp32s3")]
+extern crate alloc;
+
+use esp_backtrace as _;
+#[cfg(any(feature = "esp32s3"))]
 use esp_hal::gpio::RtcPin as RtcIoWakeupPinType;
 #[cfg(any(feature = "esp32c3", feature = "esp32c6"))]
 use esp_hal::gpio::RtcPinWithResistors as RtcIoWakeupPinType;
-#[cfg(target_arch = "riscv32")]
-use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
+use esp_hal::main;
+#[cfg(feature = "esp32c6")]
+use esp_hal::rtc_cntl::sleep::{Ext1WakeupSource, TimerWakeupSource, WakeupLevel};
+#[cfg(any(feature = "esp32c3", feature = "esp32s3"))]
 use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, TimerWakeupSource, WakeupLevel};
 use esp_hal::rtc_cntl::Rtc;
-use esp_hal::time::Rate;
-use esp_hal::timer::timg::TimerGroup;
+use esp_hal::system::SleepSource;
 
 use defmt_rtt as _;
 use esp_backtrace as _;
 
-use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
-use embassy_time::{Duration, Ticker, Timer};
-
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
-
-use static_cell::make_static;
-
-use esp_now_bridge::rgb::{Rgb, RgbLayout};
-use esp_now_bridge::ws2812::{Ws2812Single, APB_CLOCK_MHZ, RMT_CLK_DIVIDER};
-
-extern crate alloc;
-
-static LED_SIGNAL: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut COUNTER: u32 = 0;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[esp_rtos::main]
-async fn main(spawner: Spawner) {
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+#[main]
+fn main() -> ! {
     esp_alloc::heap_allocator!(size: 64 * 1024);
+    let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    defmt::info!("Init");
-
-    #[cfg(target_arch = "riscv32")]
-    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(
-        timg0.timer0,
-        #[cfg(target_arch = "riscv32")]
-        sw_int.software_interrupt0,
-    );
-
-    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(APB_CLOCK_MHZ))
-        .expect("Error initialising RMT")
-        .into_async();
-
-    let tx_config = TxChannelConfig::default()
-        .with_clk_divider(RMT_CLK_DIVIDER)
-        .with_idle_output_level(Level::Low)
-        .with_carrier_modulation(false);
-
-    #[cfg(feature = "esp32c3")]
-    let gpio = peripherals.GPIO10;
-    #[cfg(feature = "esp32s3")]
-    let gpio = peripherals.GPIO21;
-
-    let channel = rmt.channel0.configure_tx(gpio, tx_config).unwrap();
-    let mut ws2812 = Ws2812Single::new(channel, RgbLayout::Rgb);
-
-    for c in [Rgb::new(20, 0, 0), Rgb::new(0, 20, 0), Rgb::new(0, 0, 20)] {
-        defmt::info!(">> {}", c);
-        ws2812.set(c).await.unwrap();
-        Timer::after_millis(1000).await;
-        ws2812.set(Rgb::new(0, 0, 0)).await.unwrap();
-        Timer::after_millis(1000).await;
-    }
-
-    // LED task
-    spawner
-        .spawn(led_task(make_static!(ws2812)))
-        .expect("Error spawning led task");
-
+    // Setup RTC & Sleep Timer
     let mut rtc = Rtc::new(peripherals.LPWR);
     let timer = TimerWakeupSource::new(core::time::Duration::from_secs(10));
-    let mut pin5 = peripherals.GPIO5;
-    let mut rtcio_pins: &mut [(&mut dyn RtcIoWakeupPinType, WakeupLevel)] =
-        &mut [(&mut pin5, WakeupLevel::Low)];
-    let rtcio = RtcioWakeupSource::new(&mut rtcio_pins);
+    let mut pin_1 = peripherals.GPIO1;
 
-    let mut count = 0_u32;
-    loop {
-        count += 1;
-        if count.is_multiple_of(5) {
-            defmt::info!("SLEEP");
-            LED_SIGNAL.signal(true);
-            Timer::after_millis(100).await;
-            rtc.sleep_deep(&[&timer, &rtcio]);
-        }
-        defmt::info!("Tick [{}]", count);
-        Timer::after_millis(1000).await
+    {
+        // XXX This doesnt seem to work reliably across devices - probably need to use external pull-up
+        use esp_hal::gpio::RtcPinWithResistors;
+        pin_1.rtcio_pullup(true);
     }
-}
 
-#[embassy_executor::task]
-async fn led_task(ws2812: &'static mut Ws2812Single<'static>) {
-    let mut ticker = Ticker::every(Duration::from_millis(500));
-    loop {
-        for c in [Rgb::new(20, 0, 0), Rgb::new(0, 20, 0), Rgb::new(0, 0, 20)] {
-            match select(ticker.next(), LED_SIGNAL.wait()).await {
-                Either::First(_) => ws2812.set(c).await.unwrap(), // Ticker
-                Either::Second(_) => {
-                    defmt::info!("LED OFF");
-                    ws2812.set(Rgb::new(0, 0, 0)).await.unwrap(); // Signal
-                    Timer::after_millis(10).await;
-                    ws2812.set(Rgb::new(0, 0, 0)).await.unwrap(); // Signal
-                }
+    let wakeup_pins: &mut [(&mut dyn RtcIoWakeupPinType, WakeupLevel)] =
+        &mut [(&mut pin_1, WakeupLevel::Low)];
+    #[cfg(not(feature = "esp32c6"))]
+    let rtcio = RtcioWakeupSource::new(wakeup_pins);
+    #[cfg(feature = "esp32c6")]
+    let rtcio = Ext1WakeupSource::new(wakeup_pins);
+
+    let delay = esp_hal::delay::Delay::new();
+
+    let boot_time = rtc.time_since_boot().as_millis();
+    let wakeup_cause = esp_hal::rtc_cntl::wakeup_cause();
+
+    defmt::info!("INIT: wakeup={} boot={}", wakeup_cause, boot_time);
+
+    defmt::info!("COUNTER: {}", unsafe { COUNTER });
+    match wakeup_cause {
+        SleepSource::Undefined => {
+            for i in 0..5 {
+                defmt::info!("WAIT [{}]", i);
+                delay.delay_millis(1000);
             }
         }
+        _ => {}
     }
+    unsafe { COUNTER += 1 };
+
+    defmt::info!("SLEEPING:");
+    delay.delay_millis(2000);
+    rtc.sleep_deep(&[&timer, &rtcio]);
 }

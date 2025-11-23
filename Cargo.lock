@@ -3,17 +3,6 @@
 version = 4
 
 [[package]]
-name = "aht20-async"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c93801d1c9009ecef32e156413ef8f318478d1e7c7e38dc96654f412cf37827"
-dependencies = [
- "bitflags 2.9.4",
- "crc_all",
- "embedded-hal-async",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -79,17 +68,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2261d10cca569e4643e526d8dc2e62e433cc8aba21ab764233731f8d369bf394"
 
 [[package]]
-name = "bme280-rs"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97b9c5f8cda3fc2c518da006efb17147d2814349adf209911141168838ea5b54"
-dependencies = [
- "embedded-hal 1.0.0",
- "embedded-hal-async",
- "log",
-]
-
-[[package]]
 name = "bt-hci"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -145,12 +123,6 @@ name = "const-default"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b396d1f76d455557e1218ec8066ae14bba60b4b36ecd55577ba979f5db7ecaa"
-
-[[package]]
-name = "crc_all"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c46c1a17ebeef917714db3ae9a17bd2184f7e9977d8e020c6c8bcf59a28a6f1b"
 
 [[package]]
 name = "critical-section"
@@ -499,6 +471,9 @@ name = "embedded-hal"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
+dependencies = [
+ "defmt 0.3.100",
+]
 
 [[package]]
 name = "embedded-hal-async"
@@ -506,6 +481,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c4c685bbef7fe13c3c6dd4da26841ed3980ef33e841cddfa15ce8a8fb3f1884"
 dependencies = [
+ "defmt 0.3.100",
  "embedded-hal 1.0.0",
 ]
 
@@ -727,9 +703,7 @@ source = "git+https://github.com/esp-rs/esp-hal#00e6f28315ceb791278305f8f3645eb7
 name = "esp-now-bridge"
 version = "0.1.0"
 dependencies = [
- "aht20-async",
  "anyhow",
- "bme280-rs",
  "critical-section",
  "defmt 1.0.1",
  "defmt-rtt",
@@ -738,6 +712,7 @@ dependencies = [
  "embassy-futures",
  "embassy-sync 0.7.2",
  "embassy-time",
+ "embedded-hal-async",
  "embedded-io-async 0.6.1",
  "esp-alloc",
  "esp-backtrace",

@@ -11,6 +11,7 @@
 extern crate alloc;
 
 use esp_backtrace as _;
+use esp_hal::analog::adc::{Adc, AdcCalBasic, AdcConfig, AdcPin, Attenuation};
 use esp_hal::i2c;
 #[cfg(target_arch = "riscv32")]
 use esp_hal::interrupt::software::SoftwareInterruptControl;
@@ -18,20 +19,27 @@ use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::Async;
 
+use embedded_hal_async::i2c::I2c;
+
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, RawMutex};
+
 use embassy_sync::mutex::Mutex;
+use embassy_sync::signal::Signal;
 use embassy_time::Timer;
 
 use defmt_rtt as _;
-use static_cell::StaticCell;
+use static_cell::{make_static, StaticCell};
 
 use esp_backtrace as _;
 
 pub const APB_CLOCK_MHZ: u32 = 80;
 
 static I2C_BUS: StaticCell<Mutex<NoopRawMutex, i2c::master::I2c<Async>>> = StaticCell::new();
+static AHT20_READING: Signal<CriticalSectionRawMutex, Option<aht20::Aht20Reading>> = Signal::new();
+static BMP280_READING: Signal<CriticalSectionRawMutex, Option<bmp280::Bmp280Reading>> =
+    Signal::new();
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -60,6 +68,15 @@ async fn main(spawner: Spawner) {
 
     defmt::info!("ESP_RTOS initialized!");
 
+    // ADC Task
+    let adc_pin = peripherals.GPIO0;
+    let mut adc_config = AdcConfig::new();
+    let pin = adc_config.enable_pin_with_cal::<_, AdcCalBasic<_>>(adc_pin, Attenuation::_11dB);
+    let adc = Adc::new(peripherals.ADC1, adc_config).into_async();
+    let pin_static = make_static!(pin);
+    let adc_static = make_static!(adc);
+    spawner.spawn(adc_task(adc_static, pin_static)).unwrap();
+
     // Initialise I2C
     let i2c_config = i2c::master::Config::default().with_frequency(Rate::from_khz(100));
     let mut i2c = i2c::master::I2c::new(peripherals.I2C0, i2c_config)
@@ -67,6 +84,9 @@ async fn main(spawner: Spawner) {
         .with_scl(peripherals.GPIO4)
         .with_sda(peripherals.GPIO5)
         .into_async();
+
+    // Wait for bus to initialise
+    Timer::after_millis(1).await;
 
     defmt::info!("Scan I2C bus: START");
     for addr in 0..=127 {
@@ -85,10 +105,42 @@ async fn main(spawner: Spawner) {
     let bmp280_device = I2cDevice::new(i2c_bus);
     spawner.spawn(bmp280_task(bmp280_device)).unwrap();
 
+    defmt::info!("=== SIGNAL ===");
+    if let Some(r) = AHT20_READING.wait().await {
+        defmt::info!("AHT20  TEMP: {}°C", r.temp);
+        defmt::info!("       HUMIDITY: {}%", r.rh);
+    }
+
+    if let Some(r) = BMP280_READING.wait().await {
+        defmt::info!("BMP280 TEMP: {}°C", r.temp);
+        defmt::info!("       PRESSURE: {}hPa", r.pressure);
+    }
+    defmt::info!("=== SIGNAL ===");
+
     loop {
         Timer::after_millis(5000).await;
         let now = rtc.time_since_boot().as_millis();
         defmt::info!("Tick: [{}]", now - boot_time);
+    }
+}
+
+const V_REF: f32 = 1.1; // ADC refreence voltage
+const K: f32 = 3.981; // Scaling factor for 11dB atten (really 12dB?)
+
+#[embassy_executor::task]
+async fn adc_task(
+    adc: &'static mut Adc<'static, esp_hal::peripherals::ADC1<'static>, Async>,
+    pin: &'static mut AdcPin<
+        esp_hal::peripherals::GPIO0<'static>,
+        esp_hal::peripherals::ADC1<'static>,
+        AdcCalBasic<esp_hal::peripherals::ADC1<'static>>,
+    >,
+) {
+    loop {
+        let adc_raw = adc.read_oneshot(pin).await;
+        let adc_v = V_REF * K * (adc_raw as f32 / 4095.0);
+        defmt::info!("ADC Value: {}V [{}]", adc_v, adc_raw);
+        Timer::after_millis(1000).await;
     }
 }
 
@@ -97,12 +149,12 @@ async fn aht20_task(
     i2c: I2cDevice<'static, NoopRawMutex, esp_hal::i2c::master::I2c<'static, Async>>,
 ) {
     let mut aht20 = aht20::Aht20::new(i2c, 0x38);
-    defmt::info!("AHT20 INIT: {}", aht20.init().await.unwrap());
+    AHT20_READING.signal(aht20_single_measurement(&mut aht20).await.ok());
     loop {
-        let (rh, t) = aht20.read().await.unwrap();
-        defmt::info!("AHT20  TEMP: {}°C", t);
-        defmt::info!("       HUMIDITY: {}%", rh);
         Timer::after_millis(5000).await;
+        let r = aht20.read().await.unwrap();
+        defmt::info!("AHT20  TEMP: {}°C", r.temp);
+        defmt::info!("       HUMIDITY: {}%", r.rh);
     }
 }
 
@@ -111,15 +163,39 @@ async fn bmp280_task(
     i2c: I2cDevice<'static, NoopRawMutex, esp_hal::i2c::master::I2c<'static, Async>>,
 ) {
     let mut bmp280 = bmp280::Bmp280::new(i2c, 0x77);
+    BMP280_READING.signal(bmp280_single_measurement(&mut bmp280).await.ok());
+
     defmt::info!("BMP280 RESET: {}", bmp280.reset().await.unwrap());
     defmt::info!("BMP280 ID: 0x{:x}", bmp280.id().await.unwrap());
     defmt::info!("BMP280 INIT: {}", bmp280.init_default().await.unwrap());
-    defmt::info!("BMP280 WAIT: {}", bmp280.wait().await.unwrap());
     loop {
-        defmt::info!("BMP280 TEMP: {}°C", bmp280.temp().await.unwrap());
-        defmt::info!("       PRESSURE: {}hPa", bmp280.pressure().await.unwrap());
         Timer::after_millis(5000).await;
+        let bmp280::Bmp280Reading { temp, pressure } = bmp280.measure().await.unwrap();
+        defmt::info!("BMP280 TEMP: {}°C", temp);
+        defmt::info!("       PRESSURE: {}hPa", pressure);
     }
+}
+
+async fn aht20_single_measurement<M, BUS>(
+    aht20: &mut aht20::Aht20<'_, M, BUS>,
+) -> Result<aht20::Aht20Reading, aht20::Aht20Error>
+where
+    M: RawMutex,
+    BUS: I2c,
+{
+    aht20.init().await?;
+    aht20.read().await
+}
+
+async fn bmp280_single_measurement<M, BUS>(
+    bmp280: &mut bmp280::Bmp280<'_, M, BUS>,
+) -> Result<bmp280::Bmp280Reading, bmp280::Bme280Error>
+where
+    M: RawMutex,
+    BUS: I2c,
+{
+    bmp280.init_low_power().await?;
+    bmp280.force_measurement().await
 }
 
 mod aht20 {
@@ -134,6 +210,12 @@ mod aht20 {
     pub enum Aht20Error {
         I2cError,
         CrcError,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Aht20Reading {
+        pub temp: f32,
+        pub rh: f32,
     }
 
     pub struct Aht20<'a, M, BUS>
@@ -170,7 +252,7 @@ mod aht20 {
             embassy_time::Timer::after_millis(10).await;
             Ok(())
         }
-        pub async fn read(&mut self) -> Result<(f32, f32), Aht20Error> {
+        pub async fn read(&mut self) -> Result<Aht20Reading, Aht20Error> {
             self.i2c
                 .write(self.address, &[0xAC, 0x33, 0x00])
                 .await
@@ -206,7 +288,10 @@ mod aht20 {
             let temp = ((((buf[3] as u32) & 0x0F) << 16) | ((buf[4] as u32) << 8) | (buf[5] as u32))
                 as f32;
 
-            Ok((rh * 100.0 / 1_048_576.0, temp * 200.0 / 1_048_576.0 - 50.0))
+            Ok(Aht20Reading {
+                temp: temp * 200.0 / 1_048_576.0 - 50.0,
+                rh: rh * 100.0 / 1_048_576.0,
+            })
         }
     }
 
@@ -287,6 +372,12 @@ mod bmp280 {
         T4000 = 0b111,
     }
 
+    #[derive(Debug, Clone)]
+    pub struct Bmp280Reading {
+        pub temp: f32,
+        pub pressure: f32,
+    }
+
     pub struct Bmp280<'a, M, BUS>
     where
         M: RawMutex,
@@ -324,6 +415,7 @@ mod bmp280 {
             self.calibrate().await?;
             self.set_config(t_sb, filter).await?;
             self.set_ctrl_meas(os_t, os_p, mode).await?;
+            self.wait().await?;
             Ok(())
         }
         pub async fn init_default(&mut self) -> Result<(), Bme280Error> {
@@ -332,6 +424,7 @@ mod bmp280 {
             self.set_config(Standby::T500, Filter::X16).await?;
             self.set_ctrl_meas(Oversample::X1, Oversample::X16, Mode::Normal)
                 .await?;
+            self.wait().await?;
             Ok(())
         }
         pub async fn init_low_power(&mut self) -> Result<(), Bme280Error> {
@@ -340,6 +433,7 @@ mod bmp280 {
             self.set_config(Standby::T0_5, Filter::Off).await?;
             self.set_ctrl_meas(Oversample::Skip, Oversample::X1, Mode::Sleep)
                 .await?;
+            self.wait().await?;
             Ok(())
         }
         pub async fn wait(&mut self) -> Result<(), Bme280Error> {
@@ -352,11 +446,15 @@ mod bmp280 {
                 embassy_time::Timer::after_millis(10).await;
             }
         }
-        pub async fn force_measurement(&mut self) -> Result<(f32, f32), Bme280Error> {
+        pub async fn measure(&mut self) -> Result<Bmp280Reading, Bme280Error> {
+            Ok(Bmp280Reading {
+                temp: self.temp().await?,
+                pressure: self.pressure().await?,
+            })
+        }
+        pub async fn force_measurement(&mut self) -> Result<Bmp280Reading, Bme280Error> {
             self.set_ctrl_meas(Oversample::X2, Oversample::X16, Mode::Forced)
                 .await?;
-            // Wait for measurement to compete
-            self.wait().await?;
             let temp = self.temp().await?;
             let pressure = self.pressure().await?;
 
@@ -364,7 +462,7 @@ mod bmp280 {
             self.set_ctrl_meas(Oversample::X2, Oversample::X16, Mode::Sleep)
                 .await?;
 
-            Ok((temp, pressure))
+            Ok(Bmp280Reading { temp, pressure })
         }
         pub async fn id(&mut self) -> Result<u8, Bme280Error> {
             let mut buf = [0_u8; 1];
@@ -424,6 +522,8 @@ mod bmp280 {
             if self.t_calib.is_none() {
                 return Err(Bme280Error::NoCalibrationData);
             }
+            // Wait for measurement to compete
+            self.wait().await?;
             let mut buf = [0_u8; 3];
             self.read_register(TEMP, &mut buf).await?;
             let t_raw =
@@ -434,6 +534,8 @@ mod bmp280 {
             if self.p_calib.is_none() {
                 return Err(Bme280Error::NoCalibrationData);
             }
+            // Wait for measurement to compete
+            self.wait().await?;
             let mut buf = [0_u8; 3];
             self.read_register(PRESSURE, &mut buf).await?;
             let p_raw =

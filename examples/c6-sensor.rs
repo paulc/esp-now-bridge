@@ -10,7 +10,8 @@
 
 extern crate alloc;
 
-use esp_backtrace as _;
+use core::fmt::Write;
+
 use esp_hal::analog::adc::{Adc, AdcCalBasic, AdcConfig, AdcPin, Attenuation};
 use esp_hal::i2c;
 #[cfg(target_arch = "riscv32")]
@@ -18,6 +19,8 @@ use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::Async;
+
+use esp_radio::esp_now::{PeerInfo, BROADCAST_ADDRESS};
 
 use embedded_hal_async::i2c::I2c;
 
@@ -27,14 +30,14 @@ use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, R
 
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
-use embassy_time::Timer;
+use embassy_time::{with_timeout, Duration, TimeoutError, Timer};
 
-use defmt_rtt as _;
 use static_cell::{make_static, StaticCell};
 
-use esp_backtrace as _;
+use esp_now_bridge::format_mac::format_mac;
 
-pub const APB_CLOCK_MHZ: u32 = 80;
+use defmt_rtt as _;
+use esp_backtrace as _;
 
 static I2C_BUS: StaticCell<Mutex<NoopRawMutex, i2c::master::I2c<Async>>> = StaticCell::new();
 static AHT20_READING: Signal<CriticalSectionRawMutex, Option<aht20::Aht20Reading>> = Signal::new();
@@ -67,6 +70,24 @@ async fn main(spawner: Spawner) {
     );
 
     defmt::info!("ESP_RTOS initialized!");
+
+    // Initialise ESP_NOW
+    defmt::info!("Initialise ESP_NOW");
+    let esp_radio_ctrl = make_static!(esp_radio::init().unwrap());
+    let wifi = peripherals.WIFI;
+    let (mut controller, interfaces) =
+        esp_radio::wifi::new(&esp_radio_ctrl, wifi, Default::default()).unwrap();
+    controller.set_mode(esp_radio::wifi::WifiMode::Sta).unwrap();
+    controller.start().unwrap();
+
+    let mut esp_now = interfaces.esp_now;
+    esp_now.set_channel(11).unwrap();
+
+    defmt::info!("ESP-NOW VERSION: {}", esp_now.version().unwrap());
+    defmt::info!(
+        "        MAC ADDRESS: {}",
+        format_mac(&esp_radio::wifi::sta_mac())
+    );
 
     // ADC Task
     let adc_pin = peripherals.GPIO0;
@@ -105,6 +126,50 @@ async fn main(spawner: Spawner) {
     let bmp280_device = I2cDevice::new(i2c_bus);
     spawner.spawn(bmp280_task(bmp280_device)).unwrap();
 
+    let hub_address: [u8; 6];
+    let mut msg: heapless::String<64> = heapless::String::new();
+
+    loop {
+        let r = esp_now.receive_async().await;
+        defmt::info!(
+            "ESP-NOW RX: [{}]->[{}] >> {} [rssi={}]",
+            format_mac(&r.info.src_address),
+            format_mac(&r.info.dst_address),
+            core::str::from_utf8(r.data()).unwrap_or("UTF8 Error"),
+            r.info.rx_control.rssi
+        );
+        if r.info.dst_address == BROADCAST_ADDRESS {
+            if !esp_now.peer_exists(&r.info.src_address) {
+                defmt::info!("ESP-NOW ADD PEER: {}", format_mac(&r.info.src_address));
+                esp_now
+                    .add_peer(PeerInfo {
+                        interface: esp_radio::esp_now::EspNowWifiInterface::Sta,
+                        peer_address: r.info.src_address,
+                        lmk: None,
+                        channel: None,
+                        encrypt: false,
+                    })
+                    .unwrap();
+            }
+            defmt::info!("PEER ADDRESS: {}", format_mac(&r.info.src_address));
+            // Report RSSI to peer
+            msg.clear();
+            write!(
+                msg,
+                "{} -> RSSI: {}",
+                format_mac(&esp_radio::wifi::sta_mac()),
+                r.info.rx_control.rssi
+            )
+            .unwrap();
+            let status = esp_now
+                .send_async(&r.info.src_address, msg.as_bytes())
+                .await;
+            defmt::info!("REPLY PEER: {:?}", status);
+            hub_address = r.info.src_address;
+            break;
+        }
+    }
+
     defmt::info!("=== SIGNAL ===");
     if let Some(r) = AHT20_READING.wait().await {
         defmt::info!("AHT20  TEMP: {}°C", r.temp);
@@ -121,6 +186,31 @@ async fn main(spawner: Spawner) {
         Timer::after_millis(5000).await;
         let now = rtc.time_since_boot().as_millis();
         defmt::info!("Tick: [{}]", now - boot_time);
+        // Send to Hub
+        let status = esp_now.send_async(&hub_address, b"PING").await;
+        defmt::info!("ESP-NOW TX -> {}: {}", format_mac(&hub_address), status);
+
+        // Wait for response
+        loop {
+            match with_timeout(Duration::from_millis(100), esp_now.receive_async()).await {
+                Ok(r) => {
+                    defmt::info!(
+                        "ESP-NOW RX: [{}]->[{}] >> {} [rssi={}]",
+                        format_mac(&r.info.src_address),
+                        format_mac(&r.info.dst_address),
+                        core::str::from_utf8(r.data()).unwrap_or("UTF8 Error"),
+                        r.info.rx_control.rssi
+                    );
+                    if r.info.src_address == hub_address {
+                        defmt::info!("HUB RESPONSE: OK");
+                    }
+                }
+                Err(TimeoutError) => {
+                    defmt::info!("HUB RESPONSE: TIMEOUT");
+                    break;
+                }
+            }
+        }
     }
 }
 

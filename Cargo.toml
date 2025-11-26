@@ -44,7 +44,7 @@ esp32c6 = [
 esp-hal = { git = "https://github.com/esp-rs/esp-hal", features = ["unstable", "defmt"] }
 esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal", features = [] }
 esp-alloc = { git = "https://github.com/esp-rs/esp-hal", features = ["defmt"] }
-esp-backtrace = { git = "https://github.com/esp-rs/esp-hal", features = ["defmt", "panic-handler"] }
+esp-backtrace = { version = "0.18.1", features = ["defmt", "panic-handler"] }
 esp-rtos = { git = "https://github.com/esp-rs/esp-hal", features = ["esp-radio", "defmt", "embassy"] }
 esp-radio = { git = "https://github.com/esp-rs/esp-hal", features = ["esp-now", "defmt", "unstable", "wifi"] }
 
